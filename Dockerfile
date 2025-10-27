@@ -10,3 +10,4 @@ RUN g++ consumer.cpp -pthread -lrt -o consumer
 # Run both in one container, background producer, then consumer
 CMD ./producer & ./consumer &
 
+

@@ -1,107 +1,97 @@
-#include "sharedBuffer.hpp" 
-#include <iostream>
-#include <unistd.h>     // For sleep, close
-#include <fcntl.h>      // For O_* constants
-#include <sys/mman.h>   // For shared memory (mmap, shm_open)
-#include <sys/stat.h>   // For mode constants
-#include <semaphore.h>  // For POSIX semaphores
-#include <cstdlib>      // For rand, srand, exit
-#include <ctime>        // For time
-using std::cout; using std::endl;
+#include "shared.hpp"
 
-int main(){
-    srand(time(NULL) + getpid()); //seed this diferently using proccess id
-
-    //open and map the existing shared memory
-    //consuming so no need to create we want existing segment
-    int shm_fd = shm_open(SHARED_MEM_NAME, O_RDWR, 0666);
-    if (shm_fd == -1) {
-        perror("Consumer: shm_open failed");
-        exit(EXIT_FAILURE);
-        cout << "Start the producer first so shared memory and semaphores exist." << endl;
+int main() {
+    // Open Shared Memory with Retry so if producer gets started after consumer will wait
+    int shm_fd;
+    SharedData* shared_data;
+    int max_retries = 50; // 5 seconds total
+    int retry_delay_us = 100000; // 100ms
+    int attempt = 0;
+    while (true) {
+        shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+        if (shm_fd != -1) break;
+        if (++attempt >= max_retries) {
+            perror("shm_open (consumer)");
+            std::cerr << "Consumer: Did you start the producer first?" << std::endl; //for debugging
+            exit(1);
+        }
+        usleep(retry_delay_us);
     }
 
-    // map the shared memory object
-    SharedBuffer* shared_data = (SharedBuffer*)mmap(0, sizeof(SharedBuffer), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-
+    // Map the shared memory segment
+    shared_data = (SharedData*)mmap(0, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (shared_data == MAP_FAILED) {
-        perror("Consumer: mmap failed");
-        close(shm_fd);
-        exit(EXIT_FAILURE);
+        perror("mmap (consumer)");
+        exit(1);
     }
 
-    //open existing sephamores
-    sem_t* empty_sem = sem_open(SEM_EMPTY_NAME, 0);
-    sem_t* filled_sem = sem_open(SEM_FILLED_NAME, 0);
-    sem_t* mutex_sem = sem_open(SEM_MUTEX_NAME, 0);
-    sem_t* consumer_done_sem = sem_open(SEM_CONSUMER_DONE, 0);
-
-    if (empty_sem == SEM_FAILED || filled_sem == SEM_FAILED || mutex_sem == SEM_FAILED || consumer_done_sem == SEM_FAILED) {
-        perror("Consumer: sem_open failed");
-        munmap(shared_data, sizeof(SharedBuffer));
-        close(shm_fd);
-        exit(EXIT_FAILURE);
+    // Open Existing Semaphores with Retry 
+    sem_t *empty_sem = SEM_FAILED, *filled_sem = SEM_FAILED, *mutex_sem = SEM_FAILED;
+    attempt = 0;
+    while (true) {
+        empty_sem = sem_open(SEM_EMPTY_NAME, 0);
+        filled_sem = sem_open(SEM_FILLED_NAME, 0);
+        mutex_sem = sem_open(SEM_MUTEX_NAME, 0);
+        if (empty_sem != SEM_FAILED && filled_sem != SEM_FAILED && mutex_sem != SEM_FAILED) break;
+        if (++attempt >= max_retries) {
+            perror("sem_open (consumer)");
+            std::cerr << "Consumer: Did you start the producer first?" << std::endl;
+            exit(1);
+        }
+        usleep(retry_delay_us);
     }
 
-    //loop for consumer
-    int consumed_count = 0;
-    while (consumed_count < 6) { // Consume 10 items as an example
+    std::cout << "Consumer: Starting up..." << std::endl;
 
-        // wait(s) filled_sem. If it's 0, blocks (consumer waits for item).
-        cout << "Consumer: Waiting for a filled slot..." << endl;
-         if (sem_wait(filled_sem) == -1) {
-            perror("Consumer: sem_wait(filled_sem) failed"); break;
+    // Consumer Loop 
+    while (true) {
+        // Wait for a filled slot P operation on filled_sem 
+        std::cout << "Consumer: Waiting on filled slot..." << std::endl;
+        sem_wait(filled_sem);
+
+        // Wait for mutual exclusion lock active
+        std::cout << "Consumer: Waiting on mutex..." << std::endl;
+        sem_wait(mutex_sem);
+
+        //enter Critical Section 
+        
+        // Check for shutdown condition
+        // If done is true AND the buffer is empty in == out
+        if (shared_data->done && shared_data->in == shared_data->out) {
+            std::cout << "Consumer: Producer is done and buffer is empty. Shutting down." << std::endl;
+            sem_post(mutex_sem); // Release mutex before exiting so important 
+            break; // Exit the loop
         }
 
-        // Wait(s) mutex_sem. If it's 0, blocks (mutual exclusion)
-        cout << "Consumer: Entering critical section..." << endl;
-        if (sem_wait(mutex_sem) == -1) {
-            perror("Consumer: sem_wait(mutex_sem) failed");
-            sem_post(filled_sem); // Release the filled slot claimed
-            break;
-        }
-
-        // actuall critical section 
         int item = shared_data->buffer[shared_data->out];
         std::cout << "Consumer: Consumed item " << item << " from index " << shared_data->out << std::endl;
-        shared_data->out = (shared_data->out + 1) % BUFFER_SIZE; // update index
-        // end of critical sectoin
+        shared_data->out = (shared_data->out + 1) % BUFFER_SIZE;
+        // End Critical Section 
 
-        // signal(s) mutex_sem release the lock
-        if (sem_post(mutex_sem) == -1) {
-            perror("Consumer: sem_post(mutex_sem) failed"); break;
-        }
-        cout << "Consumer: Exited critical section." << endl;
+        // Signal mutual exclusion unlock the lock
+        sem_post(mutex_sem);
 
-        // signal(s) empty_sem one more slot is empty
-        if (sem_post(empty_sem) == -1) {
-             perror("Consumer: sem_post(empty_sem) failed"); break;
-        }
-
-
-        consumed_count++;
-        sleep(rand() % 2 + 1); // shpws time taken to consume an item
+        // Signal that a slot is now empty V operation on empty_sem
+        sem_post(empty_sem);
+        
+        // Add a small delay to allow the producer to run
+        usleep(1000);
+        
+         
     }
 
-    cout << "Consumer: Finished consuming. Signaling producer..." << endl;
-    if (sem_post(consumer_done_sem) == -1) { 
-        perror("Consumer: sem_post(consumer_done)");
-    } else {
-        cout << "Consumer: Successfully signaled producer." << endl;
+    for (int i = 0; i < BUFFER_SIZE; ++i) {
+        sem_post(filled_sem);
+        sem_post(empty_sem);
     }
-    cout << "Consumer: Cleaning up..." << endl;
-    // Close semaphores
+    // Cleanup no need to unlink only in producer
     sem_close(empty_sem);
     sem_close(filled_sem);
     sem_close(mutex_sem);
 
-    // Unmap shared memory
-    munmap(shared_data, sizeof(SharedBuffer));
-    // Close shared memory file descriptor
+    munmap(shared_data, sizeof(SharedData));
     close(shm_fd);
 
-    std::cout << "Consumer finished." << std::endl;
+    std::cout << "Consumer: Shutting down." << std::endl;
     return 0;
-    
 }
-

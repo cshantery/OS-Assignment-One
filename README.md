@@ -1,3 +1,5 @@
+# Producer-Consumer Problem
+
 # Overview
 - implimentation of producer consumer problem using:
     - POSIX shared memory, shm_open and mmap
@@ -18,19 +20,23 @@
     - <sys/stat.h>
 
 
-## To build/run
-- g++ -std=c++17 -pthread producer.cpp -o producer
-- g++ -std=c++17 -pthread consumer.cpp -o consumer
-- ./producer & ./consumer &
+
+## How to Build and Run
+
+$ g++ producer.cpp -pthread -lrt -o producer
+$ g++ consumer.cpp -pthread -lrt -o consumer
+
+## Run both processes concurrently
+$ ./producer & ./consumer &
 
 
-# Expected 
+## Expected 
 - producer generats randome number 0-99 and places them in shared buffer with size of 2
 - consumer will remove values from the buffer
 - uses, empty_sem, filled_sem, mutex_sem, and consumer_done_sem
 - the above counts empty lots, counts available slots, ensures mutual exclusion, and indicates whent he consumer has finished
 
-# How it works
+## How it works
 - The producer will:
     - create the shared memory and initializes the sephamores 
     - it will loop to produce ten items, note that only two will be put in the buffer at a time
@@ -43,7 +49,8 @@
     - waits for filled_sem, locks mutex_Sem, reads in item, then signals empty_sem
     - notifys producer when it has finished consuming so that producer can clean up memory
 
-## authors 
-Caroline Shantery
-Operating Systems: Programming Assignment #1
-Kent State University
+## problems
+- the program should exit after both processes output finished, however i ran into some issues where the program freezes up after everything is complete, i believe this is due to on or both of the processes waiting in the background even though its complete. I tried to add in checks to ensure both processes were woken up befor exiting. However i still ran into the same issue and unfortuantley could not find a fix befor the deadline. 
+
+# Author
+Caroline Shantery: OS asignment one
